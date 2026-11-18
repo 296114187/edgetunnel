@@ -1,0 +1,43 @@
+--- a/_worker.js
++++ b/_worker.js
+@@ -1,4 +1,5 @@
+-﻿const Version = '2026-11-10 23:26:46';
++﻿import { 后处理节点命名 } from './node-name-extension.js';
++const Version = '2026-11-10 23:26:46';
+ let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+ let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
+ const Pages静态页面 = 'https://edt-pages.github.io', EDT_版本号 = Number(String(Version).replace(/\D+/g, ''));
+@@ -467,6 +468,33 @@
+ 							}
+ 						}
+ 
++						// 自定义扩展：在订阅内容输出前按节点地区/网速重命名。由 NODE_NAME_ENABLED 控制，默认关闭；扩展内部失败不会影响原订阅。
++
++
++						订阅内容 = await 后处理节点命名(订阅内容, {
++
++
++							env, request, ctx, log, 订阅类型,
++
++
++							创建请求TCP连接器,
++
++
++							TlsClient,
++
++
++							拼接字节数据,
++
++
++							textEncoder,
++
++
++							textDecoder,
++
++
++						});
++
++
+ 						if (!ua.includes('subconverter') && 用户客户端请求订阅) {
+ 							const 打乱后HOSTS = [...config_JSON.HOSTS].sort(() => Math.random() - 0.5);
+ 							let 替换域名计数 = 0, 当前随机HOST = null;
