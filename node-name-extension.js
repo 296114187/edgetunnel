@@ -352,10 +352,10 @@ async function 批量测试(nodes, config, deps) {
 	return 结果;
 }
 
-function 替换Mixed名称(content, nodes, renameMap) {
+function 替换Mixed名称(content, nodes, byKey) {
 	const lines = content.split('\n');
 	for (const node of nodes) {
-		const newName = renameMap.get(node.oldName);
+		const newName = byKey.get(`${node.host}:${node.port}`);
 		if (!newName || !lines[node.lineIndex]) continue;
 		const line = lines[node.lineIndex];
 		const hashIndex = line.lastIndexOf('#');
@@ -365,10 +365,10 @@ function 替换Mixed名称(content, nodes, renameMap) {
 	return lines.join('\n');
 }
 
-function 替换Clash名称(content, nodes, renameMap) {
+function 替换Clash名称(content, nodes, byKey, byName) {
 	let lines = content.split('\n');
 	for (const node of nodes) {
-		const newName = renameMap.get(node.oldName);
+		const newName = byKey.get(`${node.host}:${node.port}`);
 		if (!newName || !lines[node.lineIndex]) continue;
 		const line = lines[node.lineIndex];
 		if (node.flow) {
@@ -384,7 +384,7 @@ function 替换Clash名称(content, nodes, renameMap) {
 		if (/^[a-zA-Z][\w-]*:\s*(?:#.*)?$/.test(line) && !/^proxy-groups:/i.test(line)) inGroups = false;
 		if (!inGroups) return line;
 		let result = line;
-		for (const [oldName, newName] of renameMap) {
+		for (const [oldName, newName] of byName) {
 			const oldJson = JSON.stringify(oldName), newJson = JSON.stringify(newName);
 			const oldQuoted = `'${oldName}'`, newQuoted = `'${newName}'`;
 			result = result.split(oldJson).join(newJson).split(oldQuoted).join(newQuoted);
@@ -396,18 +396,29 @@ function 替换Clash名称(content, nodes, renameMap) {
 	return lines.join('\n');
 }
 
-function 替换Singbox名称(content, renameMap) {
+function 替换Singbox名称(content, nodes, byKey, byName) {
 	let result = content;
-	for (const [oldName, newName] of renameMap) {
+	// 先按地址精确替换各 outbound 的 tag（同名节点各自改名）
+	for (const node of nodes) {
+		const newName = byKey.get(`${node.host}:${node.port}`);
+		if (!newName || node.oldName === newName) continue;
+		const oldTag = `"tag":${JSON.stringify(node.oldName)}`;
+		const escapedOld = 转义正则(node.oldName);
+		const tagRe = new RegExp(`("tag"\\s*:\\s*)${escapedOld}(?=[,}])`, 'g');
+		result = result.replace(tagRe, (all, prefix) => `${prefix}${JSON.stringify(newName)}`);
+	}
+	// 再处理 selector 等对原名的引用
+	for (const [oldName, newName] of byName) {
+		if (oldName === newName) continue;
 		result = result.split(JSON.stringify(oldName)).join(JSON.stringify(newName));
 	}
 	return result;
 }
 
-function 替换通用名称(content, nodes, renameMap) {
+function 替换通用名称(content, nodes, byKey) {
 	const lines = content.split('\n');
 	for (const node of nodes) {
-		const newName = renameMap.get(node.oldName);
+		const newName = byKey.get(`${node.host}:${node.port}`);
 		if (!newName || !lines[node.lineIndex]) continue;
 		lines[node.lineIndex] = lines[node.lineIndex].replace(/^(\s*)([^=,#]+?)(\s*=\s*)/, (all, indent, name, sep) => indent + newName + sep);
 	}
@@ -466,16 +477,20 @@ export async function 后处理节点命名(订阅内容, options = {}) {
 		写入缓存(env, cache, ctx, log);
 	}
 
-	const renameMap = new Map();
+	// byKey 按节点地址定位，解决多个节点共用同名（如多个 US）时互相覆盖的问题；
+	// byName 仅用于 Clash 节点组 / Singbox selector 对原名的引用。
+	const byKey = new Map(), byName = new Map();
 	for (const node of nodes) {
 		const cached = cache[`${node.host}:${node.port}`];
 		if (!cached?.ok || !cached.region) continue;
-		renameMap.set(node.oldName, `${cached.region}-${格式化网速(cached.mbps)}`);
+		const newName = `${cached.region}-${格式化网速(cached.mbps)}`;
+		byKey.set(`${node.host}:${node.port}`, newName);
+		if (!byName.has(node.oldName)) byName.set(node.oldName, newName);
 	}
-	if (!renameMap.size) return 订阅内容;
+	if (!byKey.size) return 订阅内容;
 
-	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 替换Singbox名称(订阅内容, renameMap);
-	if (String(订阅类型).toLowerCase().startsWith('clash')) return 替换Clash名称(订阅内容, nodes, renameMap);
-	if (nodes.some(node => node.kind === 'mixed')) return 替换Mixed名称(订阅内容, nodes, renameMap);
-	return 替换通用名称(订阅内容, nodes, renameMap);
+	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 替换Singbox名称(订阅内容, nodes, byKey, byName);
+	if (String(订阅类型).toLowerCase().startsWith('clash')) return 替换Clash名称(订阅内容, nodes, byKey, byName);
+	if (nodes.some(node => node.kind === 'mixed')) return 替换Mixed名称(订阅内容, nodes, byKey);
+	return 替换通用名称(订阅内容, nodes, byKey);
 }
