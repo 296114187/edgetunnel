@@ -1,13 +1,557 @@
 --- a/_worker.js
 +++ b/_worker.js
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,549 @@
 -﻿const Version = '2026-11-10 23:26:46';
-+﻿import { 后处理节点命名 } from './node-name-extension.js';
++/* ==== 节点命名扩展 BEGIN (内联, apply-node-name-extension.mjs 生成, 请勿手改) ==== */
++const { 后处理节点命名 } = (() => {
++// edgetunnel 节点命名后处理扩展
++// 只依赖 _worker.js 传入的运行时能力，不修改上游核心逻辑。
++// 启用变量：NODE_NAME_ENABLED=1
++
++const 缓存键 = 'node-name-cache:v1';
++const 地区映射 = new Map([
++	['HK', '中国香港'], ['TW', '中国台湾'], ['MO', '中国澳门'], ['CN', '中国'],
++	['JP', '日本'], ['KR', '韩国'], ['SG', '新加坡'], ['US', '美国'],
++	['GB', '英国'], ['DE', '德国'], ['NL', '荷兰'], ['FR', '法国'],
++	['AU', '澳大利亚'], ['CA', '加拿大'], ['IN', '印度'], ['RU', '俄罗斯'],
++	['BR', '巴西'], ['MX', '墨西哥'], ['ID', '印度尼西亚'], ['TH', '泰国'],
++	['VN', '越南'], ['MY', '马来西亚'], ['PH', '菲律宾'], ['TR', '土耳其'],
++	['IT', '意大利'], ['ES', '西班牙'], ['SE', '瑞典'], ['CH', '瑞士'],
++	['PL', '波兰'], ['UA', '乌克兰'], ['ZA', '南非'], ['AE', '阿联酋'],
++	['SA', '沙特'], ['EG', '埃及'], ['AR', '阿根廷'], ['CL', '智利'],
++	['CO', '哥伦比亚'], ['NZ', '新西兰'], ['IE', '爱尔兰'], ['BE', '比利时'],
++	['AT', '奥地利'], ['DK', '丹麦'], ['NO', '挪威'], ['FI', '芬兰'],
++	['CZ', '捷克'], ['HU', '匈牙利'], ['RO', '罗马尼亚'], ['GR', '希腊'],
++	['PT', '葡萄牙'], ['IL', '以色列'], ['PK', '巴基斯坦'], ['BD', '孟加拉国'],
++	['LK', '斯里兰卡'], ['KH', '柬埔寨'], ['LA', '老挝'], ['MM', '缅甸'],
++]);
++
++function 已启用(value) {
++	return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
++}
++
++// 诊断行以 # 注释形式插到订阅开头（此接入点在 base64 编码之前，传入的是明文）
++function mixed诊断包装(诊断头, 结果, 订阅类型) {
++	return `${诊断头}\n${结果}`;
++}
++
++function 数字配置(env, key, 默认值, 最小值, 最大值) {
++	const 原始值 = Number(env?.[key]);
++	if (!Number.isFinite(原始值)) return 默认值;
++	return Math.max(最小值, Math.min(最大值, Math.floor(原始值)));
++}
++
++function 获取地区映射(env, log) {
++	const result = new Map(地区映射);
++	const custom = env?.NODE_NAME_REGION_MAP;
++	if (!custom) return result;
++	try {
++		const parsed = JSON.parse(custom);
++		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('必须是 JSON 对象');
++		for (const [code, name] of Object.entries(parsed)) {
++			if (/^[A-Za-z]{2}$/.test(code) && typeof name === 'string' && name.trim()) result.set(code.toUpperCase(), name.trim());
++		}
++	} catch (error) {
++		try { console.warn(`[节点命名] NODE_NAME_REGION_MAP 解析失败，使用内置地区映射：${error?.message || error}`); } catch (e) { }
++	}
++	return result;
++}
++
++function 安全日志(log, ...args) {
++	try { log(...args); } catch (e) { console.log(...args); }
++}
++
++function 转义正则(text) {
++	return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++}
++
++function  stripping括号(host) {
++	return String(host || '').trim().replace(/^\[/, '').replace(/\]$/, '');
++}
++
++function 解析地址端口(值) {
++	const text = String(值 || '').trim();
++	if (!text) return null;
++	let host = '', port = 443;
++	const ipv6 = text.match(/^\[([^\]]+)\](?::(\d+))?$/);
++	if (ipv6) {
++		host = ipv6[1];
++		port = ipv6[2] ? Number(ipv6[2]) : 443;
++	} else {
++		const lastColon = text.lastIndexOf(':');
++		if (lastColon > -1 && /^\d+$/.test(text.slice(lastColon + 1))) {
++			host = text.slice(0, lastColon);
++			port = Number(text.slice(lastColon + 1));
++		} else {
++			host = text;
++		}
++	}
++	host = stripping括号(host);
++	if (!host || !Number.isFinite(port) || port < 1 || port > 65535) return null;
++	return { host, port };
++}
++
++function 解码备注(值) {
++	try { return decodeURIComponent(值); } catch (e) { return 值; }
++}
++
++function 解YAML标量(值) {
++	let text = String(值 ?? '').trim();
++	const hashIndex = text.indexOf(' #');
++	if (hashIndex > -1) text = text.slice(0, hashIndex).trim();
++	if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
++		const quote = text[0];
++		text = text.slice(1, -1);
++		if (quote === '"') {
++			try { text = JSON.parse('"' + text.replace(/"/g, '\\"') + '"'); } catch (e) { }
++		} else text = text.replace(/''/g, "'");
++	}
++	return text.trim();
++}
++
++function 提取节点(内容, 订阅类型) {
++	const text = String(内容 || '');
++	if (!text.trim()) return [];
++	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 提取Singbox节点(text);
++	if (String(订阅类型).toLowerCase().startsWith('clash')) return 提取Clash节点(text);
++	const mixed = 提取Mixed节点(text);
++	if (mixed.length) return mixed;
++	const generic = 提取通用配置节点(text);
++	return generic;
++}
++
++function 提取Mixed节点(text) {
++	const lines = text.split('\n');
++	const nodes = [];
++	lines.forEach((line, lineIndex) => {
++		const clean = line.trim();
++		if (!clean || clean.startsWith('#!') || clean.startsWith('[')) return;
++		const hashIndex = clean.lastIndexOf('#');
++		if (hashIndex < 1) return;
++		const before = clean.slice(0, hashIndex);
++		const oldName = 解码备注(clean.slice(hashIndex + 1).trim());
++		if (!oldName) return;
++		const match = before.match(/^[a-z][a-z0-9+.-]*:\/\/[^@\s]+@([^/?#\s]+)/i);
++		if (!match) return;
++		const address = 解析地址端口(match[1]);
++		if (!address) return;
++		nodes.push({ kind: 'mixed', lineIndex, oldName, host: address.host, port: address.port });
++	});
++	return nodes;
++}
++
++function 提取Clash节点(text) {
++	const lines = text.split('\n');
++	const nodes = [];
++	let inProxies = false, inGroups = false, current = null;
++
++	const flush = () => {
++		if (current && current.oldName && current.host) nodes.push(current);
++		current = null;
++	};
++
++	lines.forEach((line, lineIndex) => {
++		if (/^proxies:\s*(?:#.*)?$/i.test(line)) { flush(); inProxies = true; inGroups = false; return; }
++		if (/^proxy-groups:\s*(?:#.*)?$/i.test(line)) { flush(); inProxies = false; inGroups = true; return; }
++		if (/^[a-zA-Z][\w-]*:\s*(?:#.*)?$/.test(line) && !/^(?:proxies|proxy-groups):/i.test(line)) { flush(); inProxies = false; inGroups = false; return; }
++		if (!inProxies) return;
++
++		const listMatch = line.match(/^(\s*)-\s+(.*)$/);
++		if (listMatch) {
++			flush();
++			const rest = listMatch[2];
++			let oldName = '', host = '', port = 443, flow = false;
++			const flowName = rest.match(/^\{\s*name:\s*([^,}]+)/i);
++			const blockName = rest.match(/^name:\s*(.+)$/i);
++			if (flowName || blockName) {
++				oldName = 解YAML标量(flowName ? flowName[1] : blockName[1]);
++				flow = Boolean(flowName);
++				const flowServer = rest.match(/server:\s*([^,}]+)/i);
++				const flowPort = rest.match(/port:\s*(\d+)/i);
++				if (flowServer) host = 解YAML标量(flowServer[1]);
++				if (flowPort) port = Number(flowPort[1]);
++				current = { kind: 'clash', lineIndex, nameLineIndex: lineIndex, oldName, host, port, flow };
++			}
++			return;
++		}
++		if (current && !current.host) {
++			const serverMatch = line.match(/^\s+server:\s*(.+)$/i);
++			if (serverMatch) current.host = 解YAML标量(serverMatch[1]);
++		}
++		if (current && (!current.port || current.port === 443)) {
++			const portMatch = line.match(/^\s+port:\s*(\d+)/i);
++			if (portMatch) current.port = Number(portMatch[1]);
++		}
++	});
++	flush();
++	return nodes.filter(node => node.host && node.port);
++}
++
++function 提取Singbox节点(text) {
++	let config;
++	try { config = JSON.parse(text); } catch (e) { return []; }
++	const outbounds = Array.isArray(config?.outbounds) ? config.outbounds : [];
++	const nodes = [];
++	outbounds.forEach((item, index) => {
++		const oldName = item?.tag;
++		const rawHost = item?.server || item?.server_name || item?.hostname;
++		if (!oldName || !rawHost) return;
++		const address = 解析地址端口(String(rawHost).includes(':') && !String(rawHost).startsWith('[')
++			? `${String(rawHost).includes(':') ? '[' + rawHost + ']' : rawHost}:${item?.server_port || 443}`
++			: `${rawHost}:${item?.server_port || 443}`);
++		if (!address) return;
++		nodes.push({ kind: 'singbox', index, oldName, host: address.host, port: address.port });
++	});
++	return nodes;
++}
++
++function 提取通用配置节点(text) {
++	const lines = text.split('\n');
++	const nodes = [];
++	const 协议 = '(?:vless|trojan|vmess|ss|ssr|http|https|socks5|snell|tuic|hysteria2?)';
++	lines.forEach((line, lineIndex) => {
++		const match = line.match(new RegExp(`^\\s*([^=,#\\r\\n]+?)\\s*=\\s*${协议}\\s*,`, 'i'));
++		if (!match) return;
++		const oldName = match[1].trim().replace(/^['"]|['"]$/g, '');
++		const parts = line.slice(match[0].length - 1).split(',');
++		const hostPart = (parts[1] || '').trim();
++		const address = 解析地址端口(hostPart.includes(':') ? hostPart : `${hostPart}:443`);
++		if (!address || !oldName) return;
++		nodes.push({ kind: 'generic', lineIndex, oldName, host: address.host, port: address.port });
++	});
++	return nodes;
++}
++
++async function 带超时(promise, timeout, label) {
++	let timer;
++	try {
++		return await Promise.race([
++			promise,
++			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label}超时`)), timeout); }),
++		]);
++	} finally { if (timer) clearTimeout(timer); }
++}
++
++async function 读取HTTP响应(tls, path, config, deps) {
++	const { 拼接字节数据, textEncoder, textDecoder } = deps;
++	await tls.write(textEncoder.encode(
++		`GET ${path} HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n`
++	));
++	let buffer = new Uint8Array(0), headerEnd = -1, contentLength = null, chunked = false, status = 0;
++	const deadline = Date.now() + config.timeout;
++
++	while (Date.now() < deadline) {
++		const remaining = Math.max(1, deadline - Date.now());
++		const chunk = await 带超时(tls.read(), remaining, '读取测速响应');
++		if (!chunk || chunk.byteLength === 0) continue;
++		buffer = 拼接字节数据(buffer, chunk);
++
++		if (headerEnd === -1) {
++			const marker = new Uint8Array([13, 10, 13, 10]);
++			for (let i = 0; i <= buffer.length - marker.length; i++) {
++				if (buffer[i] === 13 && buffer[i + 1] === 10 && buffer[i + 2] === 13 && buffer[i + 3] === 10) { headerEnd = i + 4; break; }
++			}
++			if (headerEnd !== -1) {
++				const head = textDecoder.decode(buffer.slice(0, headerEnd));
++				const statusMatch = head.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/i);
++				status = statusMatch ? Number(statusMatch[1]) : 0;
++				const lengthMatch = head.match(/\r\ncontent-length:\s*(\d+)/i);
++				contentLength = lengthMatch ? Number(lengthMatch[1]) : null;
++				chunked = /\r\ntransfer-encoding:\s*chunked/i.test(head);
++			}
++		}
++		if (headerEnd !== -1) {
++			const bodyLength = buffer.length - headerEnd;
++			if (contentLength !== null && bodyLength >= contentLength) break;
++			if (chunked && textDecoder.decode(buffer.slice(headerEnd)).includes('\r\n0\r\n\r\n')) break;
++			if (bodyLength >= config.bytes + 65536) break;
++		}
++	}
++
++	if (headerEnd === -1) throw new Error('测速响应缺少HTTP头');
++	if (status < 200 || status >= 300) throw new Error(`测速响应状态异常 ${status || '未知'}`);
++	return { body: buffer.slice(headerEnd), bodyBytes: Math.max(0, buffer.length - headerEnd) };
++}
++
++let 原生连接器缓存;
++async function 获取原生连接器() {
++	if (原生连接器缓存 !== undefined) return 原生连接器缓存;
++	try {
++		const mod = await import('cloudflare:sockets');
++		原生连接器缓存 = typeof mod?.connect === 'function' ? mod.connect : null;
++	} catch (e) {
++		原生连接器缓存 = null;
++	}
++	return 原生连接器缓存;
++}
++
++async function 测试节点(node, config, deps) {
++	const { TlsClient, log, textDecoder } = deps;
++	let socket = null, tls = null;
++	const 标识 = `${node.oldName} (${node.host}:${node.port})`;
++	try {
++		const connector = await deps.创建连接器();
++		socket = await 带超时(connector({ hostname: stripping括号(node.host), port: node.port }), config.timeout, 'TCP连接');
++		tls = new TlsClient(socket, { serverName: 'speed.cloudflare.com', insecure: true, timeout: config.timeout });
++		await 带超时(tls.handshake(), config.timeout, 'TLS握手');
++		const trace = await 读取HTTP响应(tls, '/cdn-cgi/trace', config, deps);
++		const traceText = textDecoder.decode(trace.body);
++		const loc = traceText.match(/(?:^|\n)loc=([A-Za-z]{2})/i)?.[1]?.toUpperCase();
++		if (!loc) throw new Error('trace 未返回地区代码');
++		const region = config.地区映射.get(loc);
++		if (!region) throw new Error(`地区代码未识别：${loc}`);
++
++		const started = Date.now();
++		const down = await 读取HTTP响应(tls, `/__down?bytes=${config.bytes}`, config, deps);
++		const elapsed = Math.max(1, Date.now() - started);
++		if (!down.bodyBytes) throw new Error('测速下载响应为空');
++		const mbps = (down.bodyBytes * 8) / elapsed / 1000;
++		if (!Number.isFinite(mbps) || mbps <= 0) throw new Error('测速结果无效');
++		安全日志(log, `[节点命名] ${标识} -> ${region}-${格式化网速(mbps)} (${loc}, ${down.bodyBytes}B/${elapsed}ms)`);
++		try { deps.诊断记录?.push(`  + ${标识}: ${region}-${格式化网速(mbps)} (${loc}, ${down.bodyBytes}B/${elapsed}ms)`); } catch (e) { }
++		return { ok: true, region, loc, mbps, ts: Date.now() };
++	} catch (error) {
++		const reason = error?.message || String(error);
++		try { deps.诊断记录?.push(`  - ${标识}: ${reason}`); } catch (e) { }
++		try { console.warn(`[节点命名] ${标识} 测速/识别失败，保留原名称：${reason}`); } catch (e) { }
++		return { ok: false, reason, ts: Date.now() };
++	} finally {
++		try { tls?.close?.(); } catch (e) { }
++		try { socket?.close?.(); } catch (e) { }
++	}
++}
++
++function 格式化网速(mbps) {
++	const value = Math.round(mbps);
++	return `${Math.max(1, value)}M`;
++}
++
++async function 读取缓存(env, log) {
++	if (!env?.KV || typeof env.KV.get !== 'function') return {};
++	try {
++		const raw = await env.KV.get(缓存键);
++		const cache = raw ? JSON.parse(raw) : {};
++		return cache && typeof cache === 'object' && !Array.isArray(cache) ? cache : {};
++	} catch (error) {
++		try { console.warn(`[节点命名] 读取缓存失败：${error?.message || error}`); } catch (e) { }
++		return {};
++	}
++}
++
++function 写入缓存(env, cache, ctx, log) {
++	if (!env?.KV || typeof env.KV.put !== 'function') return;
++	try {
++		const keys = Object.keys(cache);
++		if (keys.length > 2000) {
++			for (const key of keys.slice(0, keys.length - 2000)) delete cache[key];
++		}
++		const task = env.KV.put(缓存键, JSON.stringify(cache)).catch(error => {
++			try { console.warn(`[节点命名] 写入缓存失败：${error?.message || error}`); } catch (e) { }
++		});
++		if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(task);
++	} catch (error) {
++		try { console.warn(`[节点命名] 写入缓存失败：${error?.message || error}`); } catch (e) { }
++	}
++}
++
++async function 批量测试(nodes, config, deps) {
++	const unique = new Map();
++	for (const node of nodes) {
++		const key = `${node.host}:${node.port}`;
++		if (!unique.has(key)) unique.set(key, node);
++	}
++	const 待测试 = [...unique.values()];
++	const 结果 = new Map();
++	let cursor = 0;
++
++	async function worker() {
++		while (cursor < 待测试.length) {
++			const index = cursor++;
++			const node = 待测试[index];
++			const key = `${node.host}:${node.port}`;
++			结果.set(key, await 测试节点(node, config, deps));
++		}
++	}
++	const 并发数 = Math.max(1, Math.min(config.concurrency, 待测试.length));
++	await Promise.all(Array.from({ length: 并发数 }, () => worker()));
++	return 结果;
++}
++
++function 替换Mixed名称(content, nodes, byKey) {
++	const lines = content.split('\n');
++	for (const node of nodes) {
++		const newName = byKey.get(`${node.host}:${node.port}`);
++		if (!newName || !lines[node.lineIndex]) continue;
++		const line = lines[node.lineIndex];
++		const hashIndex = line.lastIndexOf('#');
++		if (hashIndex < 0) continue;
++		lines[node.lineIndex] = line.slice(0, hashIndex + 1) + encodeURIComponent(newName);
++	}
++	return lines.join('\n');
++}
++
++function 替换Clash名称(content, nodes, byKey, byName) {
++	let lines = content.split('\n');
++	for (const node of nodes) {
++		const newName = byKey.get(`${node.host}:${node.port}`);
++		if (!newName || !lines[node.lineIndex]) continue;
++		const line = lines[node.lineIndex];
++		if (node.flow) {
++			lines[node.lineIndex] = line.replace(/name:\s*([^,}]+)/i, `name: ${JSON.stringify(newName)}`);
++		} else if (node.nameLineIndex === node.lineIndex) {
++			lines[node.lineIndex] = line.replace(/^(\s*-\s*name:\s*)(.+)$/i, (all, prefix) => prefix + JSON.stringify(newName));
++		}
++	}
++
++	let inGroups = false;
++	lines = lines.map(line => {
++		if (/^proxy-groups:\s*(?:#.*)?$/i.test(line)) { inGroups = true; return line; }
++		if (/^[a-zA-Z][\w-]*:\s*(?:#.*)?$/.test(line) && !/^proxy-groups:/i.test(line)) inGroups = false;
++		if (!inGroups) return line;
++		let result = line;
++		for (const [oldName, newName] of byName) {
++			const oldJson = JSON.stringify(oldName), newJson = JSON.stringify(newName);
++			const oldQuoted = `'${oldName}'`, newQuoted = `'${newName}'`;
++			result = result.split(oldJson).join(newJson).split(oldQuoted).join(newQuoted);
++			const escaped = 转义正则(oldName);
++			result = result.replace(new RegExp(`(^|[\\s,:[{])${escaped}(?=$|[\\s,\\]}])`, 'g'), (all, prefix) => prefix + newName);
++		}
++		return result;
++	});
++	return lines.join('\n');
++}
++
++function 替换Singbox名称(content, nodes, byKey, byName) {
++	let result = content;
++	// 先按地址精确替换各 outbound 的 tag（同名节点各自改名）
++	for (const node of nodes) {
++		const newName = byKey.get(`${node.host}:${node.port}`);
++		if (!newName || node.oldName === newName) continue;
++		const oldTag = `"tag":${JSON.stringify(node.oldName)}`;
++		const escapedOld = 转义正则(node.oldName);
++		const tagRe = new RegExp(`("tag"\\s*:\\s*)${escapedOld}(?=[,}])`, 'g');
++		result = result.replace(tagRe, (all, prefix) => `${prefix}${JSON.stringify(newName)}`);
++	}
++	// 再处理 selector 等对原名的引用
++	for (const [oldName, newName] of byName) {
++		if (oldName === newName) continue;
++		result = result.split(JSON.stringify(oldName)).join(JSON.stringify(newName));
++	}
++	return result;
++}
++
++function 替换通用名称(content, nodes, byKey) {
++	const lines = content.split('\n');
++	for (const node of nodes) {
++		const newName = byKey.get(`${node.host}:${node.port}`);
++		if (!newName || !lines[node.lineIndex]) continue;
++		lines[node.lineIndex] = lines[node.lineIndex].replace(/^(\s*)([^=,#]+?)(\s*=\s*)/, (all, indent, name, sep) => indent + newName + sep);
++	}
++	return lines.join('\n');
++}
++
++async function 后处理节点命名(订阅内容, options = {}) {
++	const { env = {}, request, ctx, log = console.log, 订阅类型 } = options;
++	if (!已启用(env.NODE_NAME_ENABLED)) return 订阅内容;
++
++	// 诊断模式：订阅链接加 ?namediag=1，把测速失败原因写到订阅开头（以 # 注释行呈现）
++	let 诊断模式 = false, 诊断记录 = [];
++	try {
++		const u = new URL(request?.url || '');
++		诊断模式 = ['1', 'true'].includes((u.searchParams.get('namediag') || '').toLowerCase());
++	} catch (e) { }
++
++	const config = {
++		timeout: 数字配置(env, 'NODE_NAME_TIMEOUT', 1800, 300, 8000),
++		bytes: 数字配置(env, 'NODE_NAME_BYTES', 65536, 1024, 1048576),
++		ttl: 数字配置(env, 'NODE_NAME_TTL', 3600, 60, 86400) * 1000,
++		maxTests: 数字配置(env, 'NODE_NAME_MAX_TESTS', 2, 1, 500),
++		concurrency: 数字配置(env, 'NODE_NAME_CONCURRENCY', 2, 1, 5),
++		地区映射: 获取地区映射(env, log),
++	};
++	const deps = {
++		...options,
++		诊断记录,
++		// 订阅请求的 request.fetcher 通常不可用，优先用 Workers 原生 connect()
++		创建连接器: async () => {
++			const 原生 = await 获取原生连接器();
++			if (原生) return 原生;
++			try { return options.创建请求TCP连接器(request); }
++			catch (error) {
++				if (typeof globalThis.connect === 'function') return globalThis.connect;
++				throw error;
++			}
++		},
++	};
++	const 输出 = (结果) => {
++		if (!诊断模式) return 结果;
++		const 头 = [
++			'# ===== 节点命名诊断 (namediag) =====',
++			`# 启用=${env.NODE_NAME_ENABLED} 订阅类型=${订阅类型} 变量: timeout=${config.timeout} bytes=${config.bytes} maxTests=${config.maxTests} concurrency=${config.concurrency}`,
++			`# KV绑定=${env.KV ? '有' : '无'} 原生connect=${原生连接器缓存 ? '可用' : '不可用'} request.fetcher=${request?.fetcher ? '有' : '无'}`,
++			`# 诊断记录数=${诊断记录.length}`,
++			...诊断记录,
++			'# ===== 诊断结束 =====',
++		].join('\n');
++		return mixed诊断包装(头, 结果, 订阅类型);
++	};
++
++	const nodes = 提取节点(订阅内容, 订阅类型);
++	if (诊断模式) 诊断记录.push(`提取节点数=${nodes.length}`);
++	if (!nodes.length) return 输出(订阅内容);
++
++	const cache = await 读取缓存(env, log);
++	const now = Date.now();
++	const unique = new Map();
++	for (const node of nodes) {
++		const key = `${node.host}:${node.port}`;
++		if (!unique.has(key)) unique.set(key, node);
++	}
++	const 待测试 = [];
++	for (const [key, node] of unique) {
++		const cached = cache[key];
++		if (cached && cached.ok && cached.region && now - (cached.ts || 0) < config.ttl) continue;
++		待测试.push(node);
++	}
++	const 本次测试 = 待测试.slice(0, config.maxTests);
++	if (待测试.length > 本次测试.length) {
++		安全日志(log, `[节点命名] 本请求待更新 ${待测试.length} 个，本次测速 ${本次测试.length} 个，其余保留原名称（可调高 NODE_NAME_MAX_TESTS）`);
++	}
++	if (本次测试.length) {
++		const results = await 批量测试(本次测试, config, deps);
++		for (const [key, result] of results) {
++			cache[key] = result;
++			if (!result.ok && now - (result.ts || 0) > config.ttl) delete cache[key];
++		}
++		写入缓存(env, cache, ctx, log);
++	}
++
++	// byKey 按节点地址定位，解决多个节点共用同名（如多个 US）时互相覆盖的问题；
++	// byName 仅用于 Clash 节点组 / Singbox selector 对原名的引用。
++	const byKey = new Map(), byName = new Map();
++	for (const node of nodes) {
++		const cached = cache[`${node.host}:${node.port}`];
++		if (!cached?.ok || !cached.region) continue;
++		const newName = `${cached.region}-${格式化网速(cached.mbps)}`;
++		byKey.set(`${node.host}:${node.port}`, newName);
++		if (!byName.has(node.oldName)) byName.set(node.oldName, newName);
++	}
++	if (诊断模式) 诊断记录.push(`命中改名缓存的节点数=${byKey.size}`);
++	if (!byKey.size) return 输出(订阅内容);
++
++	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 输出(替换Singbox名称(订阅内容, nodes, byKey, byName));
++	if (String(订阅类型).toLowerCase().startsWith('clash')) return 输出(替换Clash名称(订阅内容, nodes, byKey, byName));
++	if (nodes.some(node => node.kind === 'mixed')) return 输出(替换Mixed名称(订阅内容, nodes, byKey));
++	return 输出(替换通用名称(订阅内容, nodes, byKey));
++}
++	return { 后处理节点命名 };
++})();
++/* ==== 节点命名扩展 END ==== */
 +const Version = '2026-11-10 23:26:46';
  let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
  let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
  const Pages静态页面 = 'https://edt-pages.github.io', EDT_版本号 = Number(String(Version).replace(/\D+/g, ''));
-@@ -483,6 +484,15 @@
+@@ -483,6 +1028,15 @@
  								});
  						}
  
