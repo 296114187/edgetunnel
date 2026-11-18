@@ -24,6 +24,11 @@ function 已启用(value) {
 	return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase());
 }
 
+// 诊断行以 # 注释形式插到订阅开头（此接入点在 base64 编码之前，传入的是明文）
+function mixed诊断包装(诊断头, 结果, 订阅类型) {
+	return `${诊断头}\n${结果}`;
+}
+
 function 数字配置(env, key, 默认值, 最小值, 最大值) {
 	const 原始值 = Number(env?.[key]);
 	if (!Number.isFinite(原始值)) return 默认值;
@@ -262,12 +267,24 @@ async function 读取HTTP响应(tls, path, config, deps) {
 	return { body: buffer.slice(headerEnd), bodyBytes: Math.max(0, buffer.length - headerEnd) };
 }
 
+let 原生连接器缓存;
+async function 获取原生连接器() {
+	if (原生连接器缓存 !== undefined) return 原生连接器缓存;
+	try {
+		const mod = await import('cloudflare:sockets');
+		原生连接器缓存 = typeof mod?.connect === 'function' ? mod.connect : null;
+	} catch (e) {
+		原生连接器缓存 = null;
+	}
+	return 原生连接器缓存;
+}
+
 async function 测试节点(node, config, deps) {
 	const { TlsClient, log, textDecoder } = deps;
 	let socket = null, tls = null;
 	const 标识 = `${node.oldName} (${node.host}:${node.port})`;
 	try {
-		const connector = deps.创建连接器();
+		const connector = await deps.创建连接器();
 		socket = await 带超时(connector({ hostname: stripping括号(node.host), port: node.port }), config.timeout, 'TCP连接');
 		tls = new TlsClient(socket, { serverName: 'speed.cloudflare.com', insecure: true, timeout: config.timeout });
 		await 带超时(tls.handshake(), config.timeout, 'TLS握手');
@@ -285,9 +302,11 @@ async function 测试节点(node, config, deps) {
 		const mbps = (down.bodyBytes * 8) / elapsed / 1000;
 		if (!Number.isFinite(mbps) || mbps <= 0) throw new Error('测速结果无效');
 		安全日志(log, `[节点命名] ${标识} -> ${region}-${格式化网速(mbps)} (${loc}, ${down.bodyBytes}B/${elapsed}ms)`);
+		try { deps.诊断记录?.push(`  + ${标识}: ${region}-${格式化网速(mbps)} (${loc}, ${down.bodyBytes}B/${elapsed}ms)`); } catch (e) { }
 		return { ok: true, region, loc, mbps, ts: Date.now() };
 	} catch (error) {
 		const reason = error?.message || String(error);
+		try { deps.诊断记录?.push(`  - ${标识}: ${reason}`); } catch (e) { }
 		try { console.warn(`[节点命名] ${标识} 测速/识别失败，保留原名称：${reason}`); } catch (e) { }
 		return { ok: false, reason, ts: Date.now() };
 	} finally {
@@ -429,6 +448,13 @@ export async function 后处理节点命名(订阅内容, options = {}) {
 	const { env = {}, request, ctx, log = console.log, 订阅类型 } = options;
 	if (!已启用(env.NODE_NAME_ENABLED)) return 订阅内容;
 
+	// 诊断模式：订阅链接加 ?namediag=1，把测速失败原因写到订阅开头（以 # 注释行呈现）
+	let 诊断模式 = false, 诊断记录 = [];
+	try {
+		const u = new URL(request?.url || '');
+		诊断模式 = ['1', 'true'].includes((u.searchParams.get('namediag') || '').toLowerCase());
+	} catch (e) { }
+
 	const config = {
 		timeout: 数字配置(env, 'NODE_NAME_TIMEOUT', 1800, 300, 8000),
 		bytes: 数字配置(env, 'NODE_NAME_BYTES', 65536, 1024, 1048576),
@@ -439,17 +465,34 @@ export async function 后处理节点命名(订阅内容, options = {}) {
 	};
 	const deps = {
 		...options,
-		创建连接器: options.创建连接器 || (() => {
+		诊断记录,
+		// 订阅请求的 request.fetcher 通常不可用，优先用 Workers 原生 connect()
+		创建连接器: async () => {
+			const 原生 = await 获取原生连接器();
+			if (原生) return 原生;
 			try { return options.创建请求TCP连接器(request); }
 			catch (error) {
 				if (typeof globalThis.connect === 'function') return globalThis.connect;
 				throw error;
 			}
-		}),
+		},
+	};
+	const 输出 = (结果) => {
+		if (!诊断模式) return 结果;
+		const 头 = [
+			'# ===== 节点命名诊断 (namediag) =====',
+			`# 启用=${env.NODE_NAME_ENABLED} 订阅类型=${订阅类型} 变量: timeout=${config.timeout} bytes=${config.bytes} maxTests=${config.maxTests} concurrency=${config.concurrency}`,
+			`# KV绑定=${env.KV ? '有' : '无'} 原生connect=${原生连接器缓存 ? '可用' : '不可用'} request.fetcher=${request?.fetcher ? '有' : '无'}`,
+			`# 诊断记录数=${诊断记录.length}`,
+			...诊断记录,
+			'# ===== 诊断结束 =====',
+		].join('\n');
+		return mixed诊断包装(头, 结果, 订阅类型);
 	};
 
 	const nodes = 提取节点(订阅内容, 订阅类型);
-	if (!nodes.length) return 订阅内容;
+	if (诊断模式) 诊断记录.push(`提取节点数=${nodes.length}`);
+	if (!nodes.length) return 输出(订阅内容);
 
 	const cache = await 读取缓存(env, log);
 	const now = Date.now();
@@ -487,10 +530,11 @@ export async function 后处理节点命名(订阅内容, options = {}) {
 		byKey.set(`${node.host}:${node.port}`, newName);
 		if (!byName.has(node.oldName)) byName.set(node.oldName, newName);
 	}
-	if (!byKey.size) return 订阅内容;
+	if (诊断模式) 诊断记录.push(`命中改名缓存的节点数=${byKey.size}`);
+	if (!byKey.size) return 输出(订阅内容);
 
-	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 替换Singbox名称(订阅内容, nodes, byKey, byName);
-	if (String(订阅类型).toLowerCase().startsWith('clash')) return 替换Clash名称(订阅内容, nodes, byKey, byName);
-	if (nodes.some(node => node.kind === 'mixed')) return 替换Mixed名称(订阅内容, nodes, byKey);
-	return 替换通用名称(订阅内容, nodes, byKey);
+	if (String(订阅类型).toLowerCase().startsWith('singbox')) return 输出(替换Singbox名称(订阅内容, nodes, byKey, byName));
+	if (String(订阅类型).toLowerCase().startsWith('clash')) return 输出(替换Clash名称(订阅内容, nodes, byKey, byName));
+	if (nodes.some(node => node.kind === 'mixed')) return 输出(替换Mixed名称(订阅内容, nodes, byKey));
+	return 输出(替换通用名称(订阅内容, nodes, byKey));
 }
